@@ -1,0 +1,15 @@
+flask==3.0.3
+google-generativeai==0.8.3
+numpy==1.26.4
+python-dotenv==1.0.1
+googletrans==4.0.0-rc1
+
+# Note: google-generativeai is EOL upstream (Google recommends migrating to
+# the new `google-genai` package). It still works as of this writing, but
+# plan to migrate the calls in quiz_engine.py to `google.genai` when you get
+# a chance: https://github.com/googleapis/python-genai
+#
+# Note: googletrans has a history of breaking between versions because it
+# scrapes an undocumented Google Translate endpoint. If translation stops
+# working, consider swapping to `deep-translator` or the official Cloud
+# Translation API instead.
