@@ -1,91 +1,113 @@
-Welcome to the **Question Generator** and the **chatbot** project! This repository contains an innovative system that leverages reinforcement learning (RL) to generate questions, dynamically updates based on user inputs, supports multiple languages, and integrates a custom large language model (LLM) built using web scraping. Additionally, we incorporate speech capabilities using OpenAI's Whisper for text-to-speech generation.
+# Adaptive Quiz Generator
+
+A quiz system that generates questions from any text you provide, scores
+your answers with an LLM, and adjusts difficulty over time using a
+Q-learning policy. Available as a terminal app and a small Flask web app.
 
 ## Table of Contents
+
 1. [Project Overview](#project-overview)
 2. [Features](#features)
 3. [Installation](#installation)
 4. [Usage](#usage)
 5. [How It Works](#how-it-works)
-   - [Question Generator with Reinforcement Learning](#question-generator-with-reinforcement-learning)
-   - [Dynamic Updates Based on User Input](#dynamic-updates-based-on-user-input)
-   - [Multilingual Support](#multilingual-support)
-   - [Custom LLM with Web Scraping](#custom-llm-with-web-scraping)
-   - [Speech Integration with Whisper](#speech-integration-with-whisper)
 6. [Contributing](#contributing)
 7. [License](#license)
 
 ## Project Overview
-This project is designed to develop a sophisticated and adaptive question-generation system that evolves dynamically through user interaction. At its core, the system integrates cutting-edge technologies—reinforcement learning (RL), a custom-built large language model (LLM) trained on diverse web-scraped data, and advanced speech processing capabilities—to create a highly interactive and personalized user experience. The goal is to craft a tool that not only generates contextually relevant questions but also learns from each interaction, tailoring its behavior to individual user preferences over time.
 
-By leveraging reinforcement learning, the system optimizes its question-generation process through a reward-based mechanism, ensuring that the questions it produces are engaging, meaningful, and aligned with the user’s interests. The custom LLM, constructed from a rich dataset harvested through web scraping, empowers the system with a broad knowledge base and the ability to generate creative, nuanced, and context-aware responses. This LLM is further enhanced by its capacity to incorporate real-time user inputs, allowing it to refine its understanding and improve its outputs continuously.
+Given a block of text, the system generates 5 open-ended questions and 5
+multiple-choice questions grounded in that text using Gemini, grades your
+answers, tracks your accuracy per concept, and picks the next difficulty
+level (easy / medium / hard) using an epsilon-greedy Q-learning policy
+over `(difficulty, recent performance, concept mastery)` state.
 
 ## Features
-- **Reinforcement Learning Question Generator**: Generates contextually relevant questions using an RL-based approach.
-- **Dynamic Updates**: Adapts and refines outputs based on user responses in real-time.
-- **Multilingual Support**: Accepts inputs and provides outputs in multiple languages.
-- **Custom LLM**: Built from scratch using web-scraped data for unique and diverse responses.
-- **Speech Capabilities**: Uses Whisper to convert generated text into speech dynamically.
+
+- **RL-based difficulty selection** — an actual epsilon-greedy Q-learning
+  policy over difficulty/performance/mastery state, not a hardcoded
+  if/else (see [How It Works](#how-it-works)).
+- **Structured question generation** — Gemini is asked to return JSON
+  directly, so parsing is robust instead of regex-matching free text.
+- **Per-concept mastery tracking** — weak concepts are surfaced in your
+  feedback after each quiz.
+- **Optional Hindi input** — text answers can be submitted in Hindi and
+  are translated before grading.
+- **Two front ends** — `cli_quiz.py` for the terminal, `web_quiz.py` for
+  a browser-based version with per-user session state.
 
 ## Installation
+
 1. Clone the repository:
-   ```bash
-   git clone https://github.com/yourusername/question-generator.git
-   cd question-generator
    ```
-2. Install the required dependencies:
-   ```bash
+   git clone https://github.com/viswa0028/RL-based-Quiz-Generator.git
+   cd RL-based-Quiz-Generator
+   ```
+
+2. Install dependencies:
+   ```
    pip install -r requirements.txt
    ```
-3. Set up Whisper for speech generation (requires additional setup):
-   - Follow the instructions in the [Whisper GitHub repository](https://github.com/openai/whisper).
-4. (Optional) Configure language models or pretrained weights for the custom LLM.
+
+3. Set up your API key — copy `.env.example` to `.env` and fill in your
+   [Gemini API key](https://aistudio.google.com/apikey):
+   ```
+   cp .env.example .env
+   ```
+   **Never commit your `.env` file or hardcode the key in source.**
 
 ## Usage
-1. Run the main script:
-   ```bash
-   python main.py
-   ```
-2. Input your responses via text or speech (if enabled).
-3. Select your preferred language from the supported list.
-4. Receive dynamically generated questions and hear them via Whisper-generated audio.
 
-Example:
-```bash
-$ python main.py
-Enter your input: "I enjoy hiking and reading."
-Preferred language: English
-Output: "What kind of books do you read while hiking?" (spoken via Whisper)
+**Terminal version:**
 ```
+python cli_quiz.py
+```
+```
+Please enter the text to generate questions from:
+> Photosynthesis is the process by which plants convert light into energy...
+Difficulty: medium
+Q1. [photosynthesis] What raw materials do plants use during photosynthesis?
+...
+```
+
+**Web version:**
+```
+python web_quiz.py
+```
+Then open `http://127.0.0.1:5000` in your browser.
 
 ## How It Works
 
-### Question Generator with Reinforcement Learning
-- The core of the system uses a reinforcement learning model integrated with gemini api to generate questions.
-- The RL agent is trained to maximize a reward function based on user engagement and question relevance.
-- Over time, the model learns to ask better questions tailored to the user’s interests.
+### Question Generation
+`quiz_engine.generate_questions()` prompts Gemini for a JSON array of 10
+questions (5 open-ended, 5 MCQ) grounded in the supplied text, each tagged
+with a concept label. Falling back to placeholder questions only happens
+if the model output can't be parsed at all, and is now logged instead of
+silent.
 
-### Dynamic Updates Based on User Input
-- The system continuously refines its question-generation strategy by analyzing user inputs.
-- Each response influences the RL model’s policy, ensuring questions remain relevant and engaging.
-- Inputs can be text-based or speech-based (processed via Whisper).
+### Answer Evaluation
+- MCQs are scored by exact match.
+- Open-ended answers are scored 0 / 0.5 / 1 by asking Gemini to judge
+  similarity to a sample answer, with brief feedback returned alongside
+  the score.
+- Text answers detected as Hindi are translated to English before grading.
 
-### Multilingual Support
-- Users can provide answers in various languages (e.g., English, Spanish, French, etc.).
-- The system detects the input language and generates questions in the same or a user-specified language.
-- Language processing is powered by the custom LLM and external NLP libraries.
+### Difficulty Adaptation (Q-learning)
+State = `(current_difficulty, performance_bucket, concept_mastery_level)`.
+After each quiz:
+1. A reward is computed from the score, improvement over the previous
+   attempt, and current difficulty.
+2. `choose_action()` picks decrease/keep/increase difficulty using
+   epsilon-greedy selection over the Q-table — mostly exploiting the
+   best-known action, occasionally exploring at random.
+3. The Q-table is updated with the standard Q-learning update rule.
 
-### Custom LLM with Web Scraping
-- We built a unique LLM by scraping diverse datasets from the web.
-- The model is fine-tuned to generate creative and context-aware questions.
-- It dynamically incorporates user inputs to improve its knowledge base over time.
-
-### Speech Integration with Whisper
-- OpenAI’s Whisper is used to convert text outputs (questions) into natural-sounding speech.
-- Users can toggle between text-only and speech-based interactions.
-- The system processes speech inputs (if provided) and converts them into text for further analysis.
+Across repeated quizzes on the same text/session, the Q-table's learned
+values increasingly drive the difficulty choice rather than the
+random exploration term.
 
 ## Contributing
-We welcome contributions! To contribute:
+
 1. Fork the repository.
 2. Create a new branch (`git checkout -b feature-branch`).
 3. Commit your changes (`git commit -m "Add feature"`).
@@ -93,4 +115,5 @@ We welcome contributions! To contribute:
 5. Open a pull request.
 
 ## License
+
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
