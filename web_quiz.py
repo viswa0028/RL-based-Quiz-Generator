@@ -2,139 +2,152 @@
 """
 web_quiz.py
 
-Flask version of the Adaptive Quiz System.
-
-Fixes vs. the original "website for quiz generator.py":
-  - No hardcoded API key (reads GEMINI_API_KEY from environment/.env).
-  - Per-user state via Flask session instead of module-level globals
-    (the original used one shared `quiz_state`/`current_difficulty` for
-    every visitor, so two people using the app at once would corrupt
-    each other's quiz).
-  - User-supplied text (answers) is escaped before being rendered, since
-    the original built the result page HTML by hand with `|safe`, which
-    is a stored XSS vector.
-  - debug mode is off unless FLASK_DEBUG=1 is set explicitly.
-  - No threading/notebook bootstrap hacks; run with `python web_quiz.py`
-    or a proper WSGI server.
+Flask version of the Adaptive Quiz System, now with:
+  - Real user accounts (username/password, hashed with werkzeug).
+  - Persistent per-user Q-table and concept-mastery, stored in SQLite
+    (db.py) and reloaded on every login — the RL policy actually
+    accumulates learning across sessions instead of resetting each run.
+  - A /dashboard route showing quiz history and per-concept accuracy.
+  - Escaped user input in results (no stored-XSS), debug off by default,
+    secret key from environment.
 
 Setup:
     pip install -r requirements.txt
-    export GEMINI_API_KEY=your-key-here   # or put it in a .env file
+    export GEMINI_API_KEY=your-key-here
     export FLASK_SECRET_KEY=some-random-string
-
-Run:
-    python web_quiz.py
+    python web_quiz.py   # creates quiz_app.db on first run
 """
 
 import os
+import functools
 import secrets
 from collections import defaultdict
 from markupsafe import escape
 
-from flask import Flask, request, render_template_string, session
+from flask import Flask, request, render_template_string, session, redirect, url_for
 from dotenv import load_dotenv
 
 import quiz_engine as qe
+import db
 
 load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(16))
-
-# concept_mastery tracks accuracy per concept across a session's quizzes.
-# Kept server-side keyed by a per-session id rather than one shared global.
-_concept_mastery_by_session = defaultdict(lambda: defaultdict(list))
-_q_table_by_session = {}
+db.init_db()
 
 
-def _session_id():
-    if "sid" not in session:
-        session["sid"] = secrets.token_hex(8)
-    return session["sid"]
+# ---------------------------------------------------------------------------
+# Auth helper
+# ---------------------------------------------------------------------------
+
+def login_required(view_func):
+    @functools.wraps(view_func)
+    def wrapped(*args, **kwargs):
+        if "user_id" not in session:
+            return redirect(url_for("login"))
+        return view_func(*args, **kwargs)
+    return wrapped
 
 
-def _concept_mastery():
-    return _concept_mastery_by_session[_session_id()]
+# ---------------------------------------------------------------------------
+# Shared style
+# ---------------------------------------------------------------------------
 
-
-def _q_table():
-    sid = _session_id()
-    if sid not in _q_table_by_session:
-        _q_table_by_session[sid] = qe.new_q_table()
-    return _q_table_by_session[sid]
-
-
-HOME_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-<title>Adaptive Quiz System</title>
-<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
-<style>
+BASE_STYLE = """
 body { font-family: 'Poppins', sans-serif; background: linear-gradient(135deg, #74ebd5, #acb6e5);
-       margin: 0; padding: 0; min-height: 100vh; display: flex; justify-content: center; align-items: center; }
+       margin: 0; padding: 40px 20px; min-height: 100vh; box-sizing: border-box; }
 .container { background: white; padding: 40px; border-radius: 15px; box-shadow: 0 10px 30px rgba(0,0,0,0.1);
-             width: 90%; max-width: 600px; animation: fadeIn 0.5s ease-in; }
+             max-width: 700px; margin: 0 auto; animation: fadeIn 0.5s ease-in; }
 @keyframes fadeIn { from { opacity: 0; transform: translateY(-20px); } to { opacity: 1; transform: translateY(0); } }
-h1 { color: #2c3e50; text-align: center; margin-bottom: 20px; font-weight: 600; }
-p { color: #7f8c8d; text-align: center; margin-bottom: 30px; }
-textarea { width: 100%; height: 150px; padding: 15px; border: 2px solid #ecf0f1; border-radius: 10px;
-           resize: none; font-size: 16px; transition: border-color 0.3s; box-sizing: border-box; }
-textarea:focus { border-color: #3498db; outline: none; }
+h1 { color: #2c3e50; text-align: center; margin-bottom: 10px; }
+p { color: #7f8c8d; }
+a { color: #3498db; }
+input[type=text], input[type=password], textarea {
+    width: 100%; padding: 12px; border: 2px solid #ecf0f1; border-radius: 10px;
+    font-size: 16px; margin-bottom: 12px; box-sizing: border-box;
+}
 button { display: block; width: 100%; padding: 15px; background: #3498db; color: white; border: none;
-         border-radius: 10px; font-size: 16px; cursor: pointer; transition: background 0.3s, transform 0.2s; }
-button:hover { background: #2980b9; transform: translateY(-2px); }
+         border-radius: 10px; font-size: 16px; cursor: pointer; transition: background 0.3s; }
+button:hover { background: #2980b9; }
 .error { color: #e74c3c; text-align: center; margin-bottom: 15px; }
-</style>
-</head>
-<body>
+.topnav { max-width: 700px; margin: 0 auto 15px auto; display: flex; justify-content: space-between;
+          color: white; font-size: 14px; }
+.topnav a { color: white; text-decoration: underline; margin-left: 12px; }
+table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+th, td { text-align: left; padding: 8px; border-bottom: 1px solid #ecf0f1; font-size: 14px; }
+.stat-box { display: inline-block; background: #f9f9f9; border-radius: 10px; padding: 15px 20px; margin: 5px; }
+"""
+
+LOGIN_TEMPLATE = """
+<!DOCTYPE html><html><head><title>Log in</title>
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
+<style>{{ base_style }}</style></head><body>
 <div class="container">
 <h1>Adaptive Quiz System</h1>
+<p style="text-align:center;">Log in to track your progress</p>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+<form method="POST">
+<input type="text" name="username" placeholder="Username" required>
+<input type="password" name="password" placeholder="Password" required>
+<button type="submit">Log In</button>
+</form>
+<p style="text-align:center;">No account? <a href="{{ url_for('register') }}">Register</a></p>
+</div>
+</body></html>
+"""
+
+REGISTER_TEMPLATE = """
+<!DOCTYPE html><html><head><title>Register</title>
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
+<style>{{ base_style }}</style></head><body>
+<div class="container">
+<h1>Create an account</h1>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+<form method="POST">
+<input type="text" name="username" placeholder="Choose a username" required>
+<input type="password" name="password" placeholder="Choose a password" required>
+<button type="submit">Register</button>
+</form>
+<p style="text-align:center;">Already have an account? <a href="{{ url_for('login') }}">Log in</a></p>
+</div>
+</body></html>
+"""
+
+HOME_TEMPLATE = """
+<!DOCTYPE html><html><head><title>Adaptive Quiz System</title>
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
+<style>{{ base_style }}</style></head><body>
+<div class="topnav">
+  <span>Logged in as {{ username }}</span>
+  <span><a href="{{ url_for('dashboard') }}">Dashboard</a><a href="{{ url_for('logout') }}">Log out</a></span>
+</div>
+<div class="container">
+<h1>Adaptive Quiz System</h1>
+<p style="text-align:center;">Current difficulty: <strong>{{ difficulty }}</strong></p>
 <p>Enter your text below to generate a custom quiz!</p>
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
-<form method="POST" action="/quiz">
-<textarea name="text" placeholder="Type or paste your text here..." required></textarea>
+<form method="POST" action="{{ url_for('quiz') }}">
+<textarea name="text" rows="6" placeholder="Type or paste your text here..." required></textarea>
 <button type="submit">Generate Quiz</button>
 </form>
 </div>
-</body>
-</html>
+</body></html>
 """
 
 QUIZ_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-<title>Adaptive Quiz</title>
+<!DOCTYPE html><html><head><title>Adaptive Quiz</title>
 <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
-<style>
-body { font-family: 'Poppins', sans-serif; background: linear-gradient(135deg, #74ebd5, #acb6e5);
-       margin: 0; padding: 40px 20px; min-height: 100vh; }
-.container { background: white; padding: 40px; border-radius: 15px; box-shadow: 0 10px 30px rgba(0,0,0,0.1);
-             max-width: 800px; margin: 0 auto; animation: fadeIn 0.5s ease-in; }
-@keyframes fadeIn { from { opacity: 0; transform: translateY(-20px); } to { opacity: 1; transform: translateY(0); } }
-h1 { color: #2c3e50; text-align: center; margin-bottom: 10px; }
-.difficulty { text-align: center; color: #7f8c8d; margin-bottom: 30px; font-size: 18px; }
-.question { background: #f9f9f9; padding: 20px; border-radius: 10px; margin-bottom: 20px; transition: transform 0.2s; }
-.question:hover { transform: translateY(-5px); box-shadow: 0 5px 15px rgba(0,0,0,0.05); }
+<style>{{ base_style }}
+.question { background: #f9f9f9; padding: 20px; border-radius: 10px; margin-bottom: 20px; }
 .question p { color: #34495e; margin: 0 0 15px 0; font-weight: 600; }
-.options label { display: block; padding: 10px; background: #ecf0f1; margin: 5px 0; border-radius: 8px;
-                  cursor: pointer; transition: background 0.3s; }
+.options label { display: block; padding: 10px; background: #ecf0f1; margin: 5px 0; border-radius: 8px; cursor: pointer; }
 .options input[type="radio"] { margin-right: 10px; }
-.options label:hover { background: #dfe6e9; }
-textarea { width: 100%; padding: 15px; border: 2px solid #ecf0f1; border-radius: 10px; font-size: 16px;
-           resize: vertical; transition: border-color 0.3s; box-sizing: border-box; }
-textarea:focus { border-color: #3498db; outline: none; }
-button { display: block; width: 100%; padding: 15px; background: #3498db; color: white; border: none;
-         border-radius: 10px; font-size: 16px; cursor: pointer; transition: background 0.3s, transform 0.2s; }
-button:hover { background: #2980b9; transform: translateY(-2px); }
-</style>
-</head>
-<body>
+</style></head><body>
 <div class="container">
 <h1>Adaptive Quiz</h1>
-<p class="difficulty">Difficulty: {{ difficulty }}</p>
-<form method="POST" action="/submit">
+<p style="text-align:center;">Difficulty: {{ difficulty }}</p>
+<form method="POST" action="{{ url_for('submit') }}">
 {% for i in range(questions|length) %}
 <div class="question">
 <p>Q{{ i + 1 }}. [{{ concepts[i] }}] {{ questions[i] }}</p>
@@ -147,47 +160,29 @@ button:hover { background: #2980b9; transform: translateY(-2px); }
 <label><input type="radio" name="answer_{{ i }}" value="D"> D. {{ options['D'] }}</label>
 </div>
 {% else %}
-<textarea name="answer_{{ i }}" placeholder="Type your answer here..." required></textarea>
+<textarea name="answer_{{ i }}" rows="3" placeholder="Type your answer here..." required></textarea>
 {% endif %}
 </div>
 {% endfor %}
 <button type="submit">Submit Answers</button>
 </form>
 </div>
-</body>
-</html>
+</body></html>
 """
 
 RESULT_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-<title>Quiz Result</title>
+<!DOCTYPE html><html><head><title>Quiz Result</title>
 <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
-<style>
-body { font-family: 'Poppins', sans-serif; background: linear-gradient(135deg, #74ebd5, #acb6e5);
-       margin: 0; padding: 40px 20px; min-height: 100vh; display: flex; justify-content: center; align-items: center; }
-.container { background: white; padding: 40px; border-radius: 15px; box-shadow: 0 10px 30px rgba(0,0,0,0.1);
-             max-width: 800px; width: 90%; text-align: center; animation: fadeIn 0.5s ease-in; }
-@keyframes fadeIn { from { opacity: 0; transform: translateY(-20px); } to { opacity: 1; transform: translateY(0); } }
-h1 { color: #2c3e50; margin-bottom: 20px; }
-.score { font-size: 36px; color: #3498db; font-weight: 600; margin-bottom: 20px; }
-.summary { color: #34495e; font-size: 16px; text-align: left; margin-bottom: 20px; }
-.feedback-item { margin-bottom: 15px; padding: 10px; border-left: 4px solid #e74c3c; background: #f9f9f9; text-align: left; }
-.feedback-item p { margin: 5px 0; }
-.next-difficulty { color: #34495e; font-size: 18px; margin-bottom: 30px; }
-button { padding: 15px 30px; background: #3498db; color: white; border: none; border-radius: 10px;
-         font-size: 16px; cursor: pointer; transition: background 0.3s, transform 0.2s; }
-button:hover { background: #2980b9; transform: translateY(-2px); }
-</style>
-</head>
-<body>
+<style>{{ base_style }}
+.score { font-size: 36px; color: #3498db; font-weight: 600; text-align:center; margin-bottom: 20px; }
+.feedback-item { margin-bottom: 15px; padding: 10px; border-left: 4px solid #e74c3c; background: #f9f9f9; }
+</style></head><body>
 <div class="container">
 <h1>Quiz Result</h1>
 <div class="score">{{ score }} / 10</div>
-<div class="summary"><p>{{ summary_line }}</p></div>
+<p>{{ summary_line }}</p>
 {% if feedback_details %}
-<h3 style="text-align:left; color:#e74c3c;">Areas for Improvement</h3>
+<h3 style="color:#e74c3c;">Areas for Improvement</h3>
 {% for d in feedback_details %}
 <div class="feedback-item">
 <p><strong>Concept:</strong> {{ d.concept }}</p>
@@ -198,45 +193,140 @@ button:hover { background: #2980b9; transform: translateY(-2px); }
 </div>
 {% endfor %}
 {% else %}
-<p>Congratulations! No significant weaknesses identified.</p>
+<p>No significant weaknesses identified this round.</p>
 {% endif %}
-<p class="next-difficulty">Next Difficulty: {{ next_difficulty }}</p>
-<form method="GET" action="/">
-<button type="submit">Try Another Quiz</button>
-</form>
+<p><strong>Next difficulty:</strong> {{ next_difficulty }}</p>
+<form method="GET" action="{{ url_for('home') }}"><button type="submit">Try Another Quiz</button></form>
 </div>
-</body>
-</html>
+</body></html>
+"""
+
+DASHBOARD_TEMPLATE = """
+<!DOCTYPE html><html><head><title>Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
+<style>{{ base_style }}</style></head><body>
+<div class="topnav">
+  <span>Logged in as {{ username }}</span>
+  <span><a href="{{ url_for('home') }}">New quiz</a><a href="{{ url_for('logout') }}">Log out</a></span>
+</div>
+<div class="container">
+<h1>Your Progress</h1>
+{% if summary is none %}
+<p>No quizzes yet — <a href="{{ url_for('home') }}">take your first one</a>.</p>
+{% else %}
+<div>
+  <span class="stat-box"><strong>{{ summary.total_attempts }}</strong><br>quizzes taken</span>
+  <span class="stat-box"><strong>{{ summary.avg_score }}/10</strong><br>average score</span>
+  {% if summary.best_concept %}<span class="stat-box"><strong>{{ summary.best_concept }}</strong><br>strongest concept</span>{% endif %}
+  {% if summary.worst_concept %}<span class="stat-box"><strong>{{ summary.worst_concept }}</strong><br>needs work</span>{% endif %}
+</div>
+<h3>Recent attempts</h3>
+<table>
+<tr><th>Date</th><th>Difficulty</th><th>Score</th></tr>
+{% for a in summary.recent_attempts %}
+<tr><td>{{ a.created_at[:16].replace('T', ' ') }}</td><td>{{ a.difficulty }}</td><td>{{ a.score }}/10</td></tr>
+{% endfor %}
+</table>
+{% endif %}
+</div>
+</body></html>
 """
 
 
+# ---------------------------------------------------------------------------
+# Auth routes
+# ---------------------------------------------------------------------------
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "GET":
+        return render_template_string(REGISTER_TEMPLATE, base_style=BASE_STYLE, error=None)
+
+    username = request.form.get("username", "").strip()
+    password = request.form.get("password", "")
+    if not username or not password:
+        return render_template_string(
+            REGISTER_TEMPLATE, base_style=BASE_STYLE, error="Username and password are required."
+        )
+    try:
+        user_id = db.create_user(username, password)
+    except ValueError as e:
+        return render_template_string(REGISTER_TEMPLATE, base_style=BASE_STYLE, error=str(e))
+
+    session["user_id"] = user_id
+    return redirect(url_for("home"))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "GET":
+        return render_template_string(LOGIN_TEMPLATE, base_style=BASE_STYLE, error=None)
+
+    username = request.form.get("username", "").strip()
+    password = request.form.get("password", "")
+    user_id = db.verify_user(username, password)
+    if user_id is None:
+        return render_template_string(
+            LOGIN_TEMPLATE, base_style=BASE_STYLE, error="Incorrect username or password."
+        )
+    session["user_id"] = user_id
+    return redirect(url_for("home"))
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+# ---------------------------------------------------------------------------
+# Quiz routes
+# ---------------------------------------------------------------------------
+
 @app.route("/", methods=["GET"])
+@login_required
 def home():
-    return render_template_string(HOME_TEMPLATE, error=None)
+    state = db.get_user_state(session["user_id"])
+    return render_template_string(
+        HOME_TEMPLATE,
+        base_style=BASE_STYLE,
+        username=db.get_username(session["user_id"]),
+        difficulty=qe.DIFFICULTY_LEVELS[state["current_difficulty"]],
+        error=None,
+    )
 
 
 @app.route("/quiz", methods=["POST"])
+@login_required
 def quiz():
     text = request.form.get("text", "")
     if not text.strip():
-        return render_template_string(HOME_TEMPLATE, error="Text cannot be empty."), 400
+        state = db.get_user_state(session["user_id"])
+        return render_template_string(
+            HOME_TEMPLATE,
+            base_style=BASE_STYLE,
+            username=db.get_username(session["user_id"]),
+            difficulty=qe.DIFFICULTY_LEVELS[state["current_difficulty"]],
+            error="Text cannot be empty.",
+        ), 400
 
-    current_difficulty = session.get("current_difficulty", 1)
+    state = db.get_user_state(session["user_id"])
     model = qe.setup_model()
     questions, answers, concepts, is_mcq_flags = qe.generate_questions(
-        model, current_difficulty, text
+        model, state["current_difficulty"], text
     )
 
-    session["questions"] = questions
-    session["answers"] = answers
-    session["concepts"] = concepts
-    session["is_mcq_flags"] = is_mcq_flags
-    session["current_difficulty"] = current_difficulty
-    session.setdefault("previous_score", 5)
+    # Stash the generated quiz in the session (small payload, fine to keep
+    # client-side); the durable RL/mastery state lives in SQLite, not here.
+    session["quiz_questions"] = questions
+    session["quiz_answers"] = answers
+    session["quiz_concepts"] = concepts
+    session["quiz_is_mcq"] = is_mcq_flags
 
     return render_template_string(
         QUIZ_TEMPLATE,
-        difficulty=qe.DIFFICULTY_LEVELS[current_difficulty],
+        base_style=BASE_STYLE,
+        difficulty=qe.DIFFICULTY_LEVELS[state["current_difficulty"]],
         questions=questions,
         answers=answers,
         concepts=concepts,
@@ -245,16 +335,22 @@ def quiz():
 
 
 @app.route("/submit", methods=["POST"])
+@login_required
 def submit():
-    questions = session.get("questions", [])
-    answers = session.get("answers", [])
-    concepts = session.get("concepts", [])
-    is_mcq_flags = session.get("is_mcq_flags", [])
-    current_difficulty = session.get("current_difficulty", 1)
-    previous_score = session.get("previous_score", 5)
+    user_id = session["user_id"]
+    questions = session.get("quiz_questions", [])
+    answers = session.get("quiz_answers", [])
+    concepts = session.get("quiz_concepts", [])
+    is_mcq_flags = session.get("quiz_is_mcq", [])
 
     if not questions:
-        return render_template_string(HOME_TEMPLATE, error="Please start a new quiz first."), 400
+        return redirect(url_for("home"))
+
+    state = db.get_user_state(user_id)
+    q_table = state["q_table"]
+    concept_mastery = state["concept_mastery"]
+    current_difficulty = state["current_difficulty"]
+    previous_score = state["previous_score"]
 
     model = qe.setup_model()
     user_answers = [request.form.get(f"answer_{i}", "") for i in range(len(questions))]
@@ -285,8 +381,6 @@ def submit():
         if score < threshold:
             feedback_details.append(
                 {
-                    # escape() prevents a submitted answer like "<script>..."
-                    # from being rendered as live HTML (stored XSS).
                     "concept": escape(concept),
                     "question": escape(question),
                     "user_answer": escape(user_answer),
@@ -295,13 +389,11 @@ def submit():
                 }
             )
 
-    mastery_store = _concept_mastery()
     for concept, results in concept_results.items():
-        mastery_store[concept].extend(results)
+        concept_mastery[concept].extend(results)
 
-    q_table = _q_table()
     performance_bucket = qe.get_performance_bucket(previous_score)
-    mastery_level = qe.get_mastery_level(list(concept_results.keys()), mastery_store)
+    mastery_level = qe.get_mastery_level(list(concept_results.keys()), concept_mastery)
     current_state_index = qe.get_state_index(current_difficulty, performance_bucket, mastery_level)
 
     action = qe.choose_action(q_table, current_state_index)
@@ -311,9 +403,18 @@ def submit():
     next_state_index = qe.get_state_index(
         next_difficulty,
         qe.get_performance_bucket(total_score),
-        qe.get_mastery_level(list(concept_results.keys()), mastery_store),
+        qe.get_mastery_level(list(concept_results.keys()), concept_mastery),
     )
     qe.update_q_table(q_table, current_state_index, action, reward, next_state_index)
+
+    # Persist everything: this is what survives across logins/restarts.
+    db.save_user_state(user_id, q_table, concept_mastery, next_difficulty, total_score)
+    db.record_attempt(
+        user_id,
+        qe.DIFFICULTY_LEVELS[current_difficulty],
+        total_score,
+        {c: r for c, r in concept_results.items()},
+    )
 
     if total_score >= 8:
         summary_line = "Excellent work! You scored high and demonstrated strong understanding."
@@ -322,15 +423,25 @@ def submit():
     else:
         summary_line = "Keep practicing! There are several areas where you can improve your understanding."
 
-    session["previous_score"] = total_score
-    session["current_difficulty"] = next_difficulty
-
     return render_template_string(
         RESULT_TEMPLATE,
+        base_style=BASE_STYLE,
         score=total_score,
         summary_line=summary_line,
         feedback_details=feedback_details,
         next_difficulty=qe.DIFFICULTY_LEVELS[next_difficulty],
+    )
+
+
+@app.route("/dashboard")
+@login_required
+def dashboard():
+    summary = db.get_dashboard_summary(session["user_id"])
+    return render_template_string(
+        DASHBOARD_TEMPLATE,
+        base_style=BASE_STYLE,
+        username=db.get_username(session["user_id"]),
+        summary=summary,
     )
 
 
